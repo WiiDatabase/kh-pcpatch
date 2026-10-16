@@ -35,6 +35,7 @@ RCON = [1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
 PASSES = 10
 PART_SIZE = 0xFFFF0000
 FAT32_MAX = 0xFFFFFFFF
+DELTA_SUFFIX = ".delta"
 COPY_CHUNK = 16 << 20
 KINDS = ("original", "remastered", "raw")
 
@@ -73,7 +74,6 @@ def compress(data: bytes) -> bytes:
 
 
 def encode(data: bytes, comp: int, seed: bytes) -> tuple[bytes, int]:
-    """Pack data like the original entry (comp: -2 plain, -1 encrypted, >=0 zlib + encrypted)."""
     if comp > -1:
         data = compress(data)
     if comp > -2:
@@ -130,8 +130,6 @@ class PkgPlan:
 
 
 class SplitWriter:
-    """Writes one logical file, as parts 00, 01, … of PART_SIZE bytes when split is on."""
-
     def __init__(self, path: Path, split: bool):
         self.path, self.split, self.pos = path, split, 0
         self.parts: list[Path] = []
@@ -286,18 +284,37 @@ def rebuild_asset(f: BinaryIO, e: HedEntry, ch: Change, name: str, st: Stats) ->
 
 
 def patch_pkg(
-    game_dir: Path, out_dir: Path, pkg: str, entries: list[HedEntry], plan: PkgPlan, split: bool, progress: Progress
+    game_dir: Path,
+    out_dir: Path,
+    pkg: str,
+    entries: list[HedEntry],
+    plan: PkgPlan,
+    split: bool,
+    delta: bool,
+    progress: Progress,
 ) -> Stats:
     st = Stats()
     total = sum(e.data_len for e in entries)
     task = progress.add_task(pkg, total=total)
-    out = SplitWriter(out_dir / f"{pkg}.pkg", split)
+    src_pkg = game_dir / f"{pkg}.pkg"
+    base = src_pkg.stat().st_size if delta else 0
+    out = SplitWriter(out_dir / f"{pkg}.pkg{DELTA_SUFFIX if delta else ''}", split)
     hed = bytearray()
-    with (game_dir / f"{pkg}.pkg").open("rb") as f:
+
+    def start_asset() -> int:
+        if delta:
+            out.write(bytes(-(base + out.pos) % 16))
+        return base + out.pos
+
+    with src_pkg.open("rb") as f:
         buf = bytearray(COPY_CHUNK)
         for e in entries:
-            pos = out.pos
             ch = plan.changes.get(e.md5)
+            if delta and ch is None:
+                hed += e.md5 + struct.pack("<Qii", e.offset, e.data_len, e.actual_len)
+                progress.advance(task, e.data_len)
+                continue
+            pos = start_asset()
             if e.data_len == 0:
                 hed += e.md5 + struct.pack("<Qii", pos, 0, e.actual_len)
                 continue
@@ -314,10 +331,10 @@ def patch_pkg(
             else:
                 data, actual = rebuild_asset(f, e, ch, plan.names.get(e.md5, e.md5.hex()), st)
                 out.write(data)
-            hed += e.md5 + struct.pack("<Qii", pos, out.pos - pos, actual)
+            hed += e.md5 + struct.pack("<Qii", pos, base + out.pos - pos, actual)
             progress.advance(task, e.data_len)
     for name, src, kind in plan.added:
-        pos = out.pos
+        pos = start_asset()
         raw = src.read()
         if kind == "raw":
             out.write(raw)
@@ -325,9 +342,11 @@ def patch_pkg(
         else:
             out.write(struct.pack("<iiii", len(raw), 0, -2, -1) + pad16(raw, 0xCD))
             actual = len(raw)
-        hed += md5(name) + struct.pack("<Qii", pos, out.pos - pos, actual)
+        hed += md5(name) + struct.pack("<Qii", pos, base + out.pos - pos, actual)
         st.added += 1
     out.close()
+    if delta and out.pos > FAT32_MAX:
+        raise click.ClickException(f"{pkg}{DELTA_SUFFIX} is {out.pos} bytes, over the FAT32 limit")
     (out_dir / f"{pkg}.hed").write_bytes(hed)
     progress.update(task, completed=total)
     return st
@@ -350,6 +369,12 @@ def cli() -> None:
 )
 @click.option("-x", "--exclude", multiple=True, help="Glob on patch paths to skip, e.g. '*/title.2ld/*'. Repeatable.")
 @click.option("--split", is_flag=True, help="Write pkgs over 4 GiB as FAT32 concatenation folders (parts 00, 01, …).")
+@click.option(
+    "--delta",
+    is_flag=True,
+    help="Write each changed pkg as <name>.pkg.delta holding only new assets, read after the original pkg "
+    "(needs the kh-pkg-overlay plugin).",
+)
 @click.option("-j", "--jobs", default=3, show_default=True, help="Pkgs patched in parallel.")
 @click.option("-v", "--verbose", is_flag=True, help="List every skipped patch file.")
 def apply(
@@ -358,6 +383,7 @@ def apply(
     output: Path,
     exclude: tuple[str, ...],
     split: bool,
+    delta: bool,
     jobs: int,
     verbose: bool,
 ) -> None:
@@ -365,6 +391,8 @@ def apply(
 
     Files are replaced in every pkg that contains them, wherever the patch put them.
     """
+    if split and delta:
+        raise click.UsageError("--split and --delta exclude each other")
     tree, skipped = load_patches(patches, exclude)
     plans, heds, problems = build_plan(game_dir, tree)
     missing = sorted(p for p in plans if not (game_dir / f"{p}.pkg").exists())
@@ -384,7 +412,7 @@ def apply(
         ThreadPoolExecutor(jobs) as pool,
     ):
         futures = {
-            pool.submit(patch_pkg, game_dir, output, pkg, heds[pkg], plan, split, progress): pkg
+            pool.submit(patch_pkg, game_dir, output, pkg, heds[pkg], plan, split, delta, progress): pkg
             for pkg, plan in plans.items()
         }
         for fut in as_completed(futures):
@@ -406,23 +434,19 @@ def length_ok(got: int, expected: int) -> bool:
     return got in (expected, expected + (-expected % 16))
 
 
-def verify_pkg(hed: Path, progress: Progress) -> list[str]:
-    errors: list[str] = []
-    entries = read_hed(hed)
-    task = progress.add_task(hed.stem, total=sum(e.data_len for e in entries))
-    pkg = hed.with_suffix(".pkg")
-    files = sorted(pkg.iterdir()) if pkg.is_dir() else [pkg]
-    handles = [p.open("rb") for p in files]
+class PkgReader:
+    def __init__(self, pkg: Path, delta: Path | None):
+        parts = sorted(pkg.iterdir()) if pkg.is_dir() else [pkg]
+        self.handles = [p.open("rb") for p in parts]
+        self.size = sum(p.stat().st_size for p in parts)
+        self.delta = delta.open("rb") if delta else None
 
-    def read_at(off: int, n: int) -> bytes:
-        if len(handles) == 1:
-            handles[0].seek(off)
-            return handles[0].read(n)
+    def _read_base(self, off: int, n: int) -> bytes:
         out = bytearray()
         while n:
-            part, rel = divmod(off, PART_SIZE)
-            handles[part].seek(rel)
-            chunk = handles[part].read(min(n, PART_SIZE - rel))
+            part, rel = divmod(off, PART_SIZE) if len(self.handles) > 1 else (0, off)
+            self.handles[part].seek(rel)
+            chunk = self.handles[part].read(n if len(self.handles) == 1 else min(n, PART_SIZE - rel))
             if not chunk:
                 break
             out += chunk
@@ -430,10 +454,44 @@ def verify_pkg(hed: Path, progress: Progress) -> list[str]:
             n -= len(chunk)
         return bytes(out)
 
+    def read(self, off: int, n: int) -> bytes:
+        head = b""
+        if off < self.size:
+            head = self._read_base(off, min(n, self.size - off))
+            if len(head) == n or self.delta is None:
+                return head
+            off, n = self.size, n - len(head)
+        if self.delta is None:
+            return head
+        self.delta.seek(off - self.size)
+        return head + self.delta.read(n)
+
+    def close(self) -> None:
+        for h in self.handles:
+            h.close()
+        if self.delta:
+            self.delta.close()
+
+
+def verify_pkg(hed: Path, base_dir: Path | None, progress: Progress) -> list[str]:
+    errors: list[str] = []
+    entries = read_hed(hed)
+    task = progress.add_task(hed.stem, total=sum(e.data_len for e in entries))
+    delta = hed.with_name(hed.stem + ".pkg" + DELTA_SUFFIX)
+    if delta.exists():
+        if base_dir is None:
+            return [f"{hed.stem}: {delta.name} needs --base with the original {hed.stem}.pkg"]
+        reader = PkgReader(base_dir / f"{hed.stem}.pkg", delta)
+    else:
+        reader = PkgReader(hed.with_suffix(".pkg"), None)
+
     for e in entries:
         if e.data_len == 0:
             continue
-        blob = read_at(e.offset, e.data_len)
+        blob = reader.read(e.offset, e.data_len)
+        if len(blob) != e.data_len:
+            errors.append(f"{hed.stem} {e.md5.hex()}: archive ends inside the asset")
+            continue
         try:
             dec, cnt, comp, _ = struct.unpack_from("<iiii", blob)
             seed = blob[:16]
@@ -462,24 +520,33 @@ def verify_pkg(hed: Path, progress: Progress) -> list[str]:
         except (zlib.error, struct.error) as ex:
             errors.append(f"{hed.stem} {e.md5.hex()}: {ex}")
         progress.advance(task, e.data_len)
-    for h in handles:
-        h.close()
+    reader.close()
     return errors
 
 
 @cli.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--base",
+    "base_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Folder with the original pkgs, for checking .pkg.delta output.",
+)
 @click.option("-j", "--jobs", default=4, show_default=True)
-def verify(directory: Path, jobs: int) -> None:
+def verify(directory: Path, base_dir: Path | None, jobs: int) -> None:
     """Decrypt and decompress every asset of every hed/pkg pair in DIRECTORY and check the layout."""
-    heds = sorted(h for h in directory.glob("*.hed") if h.with_suffix(".pkg").exists())
+    heds = sorted(
+        h
+        for h in directory.glob("*.hed")
+        if h.with_suffix(".pkg").exists() or h.with_name(h.stem + ".pkg" + DELTA_SUFFIX).exists()
+    )
     with (
         Progress(
             TextColumn("{task.description:12}"), BarColumn(), DownloadColumn(), TimeRemainingColumn(), console=console
         ) as progress,
         ThreadPoolExecutor(jobs) as pool,
     ):
-        errors = [err for errs in pool.map(lambda h: verify_pkg(h, progress), heds) for err in errs]
+        errors = [err for errs in pool.map(lambda h: verify_pkg(h, base_dir, progress), heds) for err in errs]
     for err in errors[:50]:
         console.print(f"[red]{err}[/]")
     if errors:

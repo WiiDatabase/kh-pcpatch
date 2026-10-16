@@ -4,6 +4,8 @@ Applies KHPCPatchManager patches (`.kh1pcpatch`, `.kh2pcpatch`, `.compcpatch`, `
 
 It has been tested on a Switch with the German voice patches for Kingdom Hearts Final Mix and Kingdom Hearts II Final Mix. Other games and patches use the same code paths but have not been tried.
 
+Made with Claude for my own use case, so I'm not interested in taking feature requests.
+
 ## Requirements
 
 [uv](https://docs.astral.sh/uv/). The script declares its dependencies inline, so `uv` installs them on the first run.
@@ -12,7 +14,7 @@ It has been tested on a Switch with the German voice patches for Kingdom Hearts 
 
 ```sh
 ./kh-pcpatch.py apply GAME_DIR PATCH [PATCH ...] -o OUTPUT [options]
-./kh-pcpatch.py verify DIRECTORY
+./kh-pcpatch.py verify DIRECTORY [--base GAME_DIR]
 ```
 
 `GAME_DIR` is the folder with the game's `<name>.hed` and `<name>.pkg` files, such as `Image/en` on PC. `apply` writes only the archives that change to `OUTPUT` and leaves `GAME_DIR` untouched. When you pass several patches, a later patch overrides files of an earlier one.
@@ -22,10 +24,15 @@ It has been tested on a Switch with the German voice patches for Kingdom Hearts 
 | `-o`, `--output DIR` | Folder for the patched `.hed`/`.pkg` pairs |
 | `-x`, `--exclude GLOB` | Skip patch files whose path matches, e.g. `'*/title.2ld/*'`. Repeatable |
 | `--split` | Write archives over 4 GiB as FAT32 concatenation folders (see below) |
+| `--delta` | Write `.hed` + `.pkg.delta` instead of a full `.pkg` (see below). Excludes `--split` |
 | `-j`, `--jobs N` | Archives patched in parallel (default 3) |
 | `-v`, `--verbose` | List every patch file that has no target |
 
-`verify` decrypts and decompresses every asset of every `.hed`/`.pkg` pair in a folder and checks offsets and sizes. Run it on the output before you copy it anywhere.
+`verify` decrypts and decompresses every asset of every `.hed`/`.pkg` pair in a folder and checks offsets and sizes. Run it on the output before you copy it anywhere. For delta output, pass the folder with the original `.pkg` files as `--base`.
+
+### Delta output
+
+With `--delta`, `apply` does not copy the unchanged assets. It writes the patched `.hed` and a `<name>.pkg.delta` that holds only the rebuilt and added assets. Their hed offsets count from the end of the original `.pkg`, so the game has to read the archive as the original file followed by the delta. On the Switch, use the [kh-pkg-overlay plugin](https://github.com/WiiDatabase/kh-pkg-overlay).
 
 ### Where files go
 
