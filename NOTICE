@@ -1,0 +1,11 @@
+kh-pcpatch
+
+The archive encryption and the patch layout are reimplemented from:
+
+OpenKH - Open Kingdom Hearts Research and Development
+Copyright 2019-2022 OpenKH Team and Contributors
+This product includes software developed at
+The OpenKH GitHub Repository (https://git.openkh.dev/).
+
+KHPCPatchManager by AntonioDePau (https://github.com/AntonioDePau/KHPCPatchManager),
+licensed under the Apache License 2.0.
